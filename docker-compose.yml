@@ -1,0 +1,243 @@
+services:
+    postgres:
+        build:
+            dockerfile: Dockerfile
+        container_name: books_db
+        environment:
+            POSTGRES_USER: ${POSTGRES_USER}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            POSTGRES_DB: ${POSTGRES_DB}
+        volumes:
+            - ./pgdata:/var/lib/postgresql/data
+        ports:
+            - "5432:5432"
+        healthcheck:
+            test: bash -c 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'
+            interval: 5s
+            timeout: 5s
+            retries: 5
+        command: >
+            postgres
+              -c shared_preload_libraries=pg_stat_statements
+              -c pg_stat_statements.track=all
+
+    flyway:
+        container_name: flyway
+        image: flyway/flyway:9.22
+        depends_on:
+            postgres:
+                condition:
+                    service_healthy
+        volumes:
+            - ./migrations:/flyway/sql
+        environment:
+            - FLYWAY_PLACEHOLDERS_ANALYST_NAMES=${ANALYST_NAMES}
+        command:
+            - -url=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+            - -user=${POSTGRES_USER}
+            - -password=${POSTGRES_PASSWORD}
+            - -locations=filesystem:/flyway/sql
+            - -target=${MIGRATION_VERSION:-latest}
+            - migrate
+
+    seeder:
+        container_name: seeder
+        build:
+            context: .
+            dockerfile: Dockerfile
+        depends_on:
+            flyway:
+                condition: service_completed_successfully
+        environment:
+            POSTGRES_DB: ${POSTGRES_DB}
+            POSTGRES_USER: ${POSTGRES_USER}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            PGPASSWORD: ${POSTGRES_PASSWORD}
+            APP_ENV: ${APP_ENV}
+            SEED_COUNT: ${SEED_COUNT:-15}
+        volumes:
+            - ./faker-seeder:/docker-entrypoint-initdb.d
+        entrypoint: [ "bash", "-c" ]
+        command:
+            - |
+                if [ "$APP_ENV" = "dev" ]; then
+                  echo "Seeding DB with $SEED_COUNT rows"; \
+                  sed "s/__SEED_COUNT__/$SEED_COUNT/g" /docker-entrypoint-initdb.d/seed.sql > /tmp/seed_final.sql; \
+                  psql -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /tmp/seed_final.sql; \
+                else
+                  echo "Skipping seeding: APP_ENV=$APP_ENV";
+                fi
+
+    service:
+        container_name: service
+        build:
+            context: ./service
+        depends_on:
+            postgres:
+                condition: service_healthy
+            seeder:
+                condition: service_completed_successfully
+
+        restart: always
+        environment:
+            POSTGRES_HOST: postgres
+            POSTGRES_PORT: 5432
+            POSTGRES_DB: ${POSTGRES_DB}
+            POSTGRES_USER: ${POSTGRES_USER}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            LOAD_INTERVAL: 5
+            LOAD_COUNT: 10
+
+    postgres_exporter:
+        image: prometheuscommunity/postgres-exporter
+        container_name: postgres_exporter
+        restart: always
+        ports:
+            - "9187:9187"
+        environment:
+            DATA_SOURCE_NAME: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+        volumes:
+            - ./postgres_exporter.yml:/etc/postgres_exporter/queries.yml:ro
+        command: --extend.query-path=/etc/postgres_exporter/queries.yml
+        depends_on:
+            - postgres
+
+    prometheus:
+        image: prom/prometheus
+        container_name: prometheus
+        volumes:
+            - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+        ports:
+            - "9090:9090"
+        depends_on:
+            - postgres_exporter
+
+    grafana:
+        image: grafana/grafana
+        container_name: grafana
+        restart: always
+        ports:
+            - "3000:3000"
+        environment:
+            - GF_SECURITY_ADMIN_PASSWORD=admin
+        volumes:
+            - grafana-storage:/var/lib/grafana
+        depends_on:
+            - prometheus
+
+    pg_backup:
+        image: postgres:14-alpine
+        container_name: pg_backup
+        depends_on:
+            postgres:
+                condition: service_healthy
+        environment:
+            POSTGRES_HOST: haproxy
+            POSTGRES_PORT: 5432
+            POSTGRES_DB: ${POSTGRES_DB}
+            POSTGRES_USER: ${POSTGRES_USER}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            BACKUP_INTERVAL_CRON: ${BACKUP_INTERVAL_CRON}
+            BACKUP_RETENTION_COUNT: ${BACKUP_RETENTION_COUNT}
+        volumes:
+            - ./backup-scripts:/opt/backup:ro
+            - ./backups:/backups
+        entrypoint: [ "/bin/sh", "/opt/backup/cron_runner.sh" ]
+
+    etcd:
+        image: quay.io/coreos/etcd:v3.5.15
+        container_name: etcd
+        ports:
+            - "2379:2379"
+        command:
+            - /usr/local/bin/etcd
+            - --name=etcd0
+            - --data-dir=/etcd-data
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --advertise-client-urls=http://etcd:2379
+            - --initial-advertise-peer-urls=http://etcd:2380
+            - --enable-v2=true
+        restart: always
+
+    patroni-1:
+        image: ghcr.io/zalando/spilo-16:3.3-p1
+        container_name: patroni-1
+        environment:
+            PATRONI_NAME: patroni-1
+            SCOPE: books
+            ETCD_HOSTS: etcd:2379
+            PGVERSION: "16"
+            PGUSER_SUPERUSER: postgres
+            PGPASSWORD_SUPERUSER: ${POSTGRES_PASSWORD}
+            PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+            PATRONI_POSTGRESQL_CONNECT_ADDRESS: patroni-1:5432
+            PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+            PATRONI_RESTAPI_CONNECT_ADDRESS: patroni-1:8008
+            CLONE_METHOD: pg_basebackup
+            CLONE_HOST: postgres
+            CLONE_PORT: "5432"
+            CLONE_USER: ${POSTGRES_USER}
+            CLONE_PASSWORD: ${POSTGRES_PASSWORD}
+            CLONE_SSLMODE: disable
+        volumes:
+            - patroni-1-data:/home/postgres/pgdata
+        depends_on:
+            - etcd
+        ports:
+            - "5441:5432"
+            - "8001:8008"
+        healthcheck:
+            test: ["CMD", "bash", "-lc", "python3 -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=2).status==200 else sys.exit(1)\""]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    patroni-2:
+        image: ghcr.io/zalando/spilo-16:3.3-p1
+        container_name: patroni-2
+        environment:
+            PATRONI_NAME: patroni-2
+            SCOPE: books
+            ETCD_HOSTS: etcd:2379
+            PGVERSION: "16"
+            PGUSER_SUPERUSER: postgres
+            PGPASSWORD_SUPERUSER: ${POSTGRES_PASSWORD}
+            PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+            PATRONI_POSTGRESQL_CONNECT_ADDRESS: patroni-2:5432
+            PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+            PATRONI_RESTAPI_CONNECT_ADDRESS: patroni-2:8008
+            CLONE_METHOD: pg_basebackup
+            CLONE_HOST: postgres
+            CLONE_PORT: "5432"
+            CLONE_USER: ${POSTGRES_USER}
+            CLONE_PASSWORD: ${POSTGRES_PASSWORD}
+            CLONE_SSLMODE: disable
+        volumes:
+            - patroni-2-data:/home/postgres/pgdata
+        depends_on:
+            - etcd
+        ports:
+            - "5442:5432"
+            - "8002:8008"
+        healthcheck:
+            test: [ "CMD", "bash", "-lc", "python3 -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=2).status==200 else sys.exit(1)\"" ]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    haproxy:
+        image: haproxy:2.9
+        container_name: haproxy
+        depends_on:
+            - patroni-1
+            - patroni-2
+        volumes:
+            - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+        ports:
+            - "5433:5432"
+        restart: always
+volumes:
+    grafana-storage:
+    patroni-1-data:
+    patroni-2-data:

@@ -1,0 +1,17 @@
+CREATE TABLE IF NOT EXISTS shops (
+    id UUID PRIMARY KEY,
+    seller_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shop_branches (
+    id UUID PRIMARY KEY,
+    shop_id UUID NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+    address TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS customer_shop_preferences (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    shop_id UUID NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, shop_id)
+);
